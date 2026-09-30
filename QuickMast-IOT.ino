@@ -1,11 +1,17 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
+#include <ESP8266mDNS.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
 // ---------- WiFi ----------
-const char* ssid = "SEU_WIFI";
-const char* password = "SUA_SENHA";
+const char* ssid = "WIFI";
+const char* password = "SENHA";
+
+// ---------- Configuracao do modo AP (fallback) ----------
+const char* AP_SSID = "QuickMast";
+const char* AP_PASSWORD = "";
+const unsigned long WIFI_TIMEOUT_MS = 8000;
 
 // ---------- Pinos ----------
 #define ONE_WIRE_BUS D2
@@ -16,16 +22,16 @@ DallasTemperature sensors(&oneWire);
 ESP8266WebServer server(80);
 
 // ---------- Parametros de referencia (ajustar apos calibracao real) ----------
-const float TEMP_REF = 40.0;           // temperatura media de referencia (graus C)
-const float COND_REF = 400.0;          // condutividade media de referencia
-const float MARGIN = 1.20;             // margem de 20% sobre a referencia absoluta
-const float REL_THRESHOLD = 0.20;      // 20% de desvio percentual em relacao aos outros tetos
-const float MIN_ABS_DIFF_TEMP = 1.0;   // diferenca minima em graus C pra considerar relevante
-const float MIN_ABS_DIFF_COND = 50.0;  // diferenca minima de condutividade pra considerar relevante
+const float TEMP_REF = 40.0;
+const float COND_REF = 400.0;
+const float MARGIN = 1.20;
+const float REL_THRESHOLD = 0.20;
+const float MIN_ABS_DIFF_TEMP = 1.0;
+const float MIN_ABS_DIFF_COND = 50.0;
 
 // ---------- Estado do teste ----------
 bool testRunning = false;
-int currentTeat = 0; // 0 = nenhum teste iniciado, 1-4 = teto atual, 5 = concluido
+int currentTeat = 0;
 
 float temps[4] = {0, 0, 0, 0};
 float conds[4] = {0, 0, 0, 0};
@@ -33,7 +39,6 @@ bool captured[4] = {false, false, false, false};
 bool mastiteDetectado[4] = {false, false, false, false};
 bool resultadosCalculados = false;
 
-// ---------- Pagina HTML ----------
 const char PAGE_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="pt-br">
@@ -51,6 +56,7 @@ const char PAGE_HTML[] PROGMEM = R"rawliteral(
   #btnCapturar { background:#1565c0; }
   #btnParar { background:#e65100; }
   #btnReiniciar { background:#616161; }
+  #btnLeitura { background:#6a1b9a; }
   table { width:100%; border-collapse:collapse; background:#fff; border-radius:6px; overflow:hidden; }
   th, td { padding:10px; text-align:center; border-bottom:1px solid #ddd; }
   th { background:#333; color:#fff; }
@@ -58,11 +64,21 @@ const char PAGE_HTML[] PROGMEM = R"rawliteral(
   .alerta { color:#c62828; font-weight:bold; }
   .aguardando { color:#999; }
   #warning { display:none; background:#c62828; color:#fff; padding:15px; border-radius:6px; text-align:center; margin-top:15px; font-weight:bold; }
+  #leituraPanel { display:none; position:relative; background:#ede7f6; border:1px solid #6a1b9a; border-radius:6px; padding:12px 36px 12px 12px; text-align:center; margin-bottom:20px; font-size:15px; color:#4a148c; }
+  #fecharLeitura { position:absolute; top:6px; right:10px; cursor:pointer; font-size:18px; font-weight:bold; color:#4a148c; }
 </style>
 </head>
 <body>
   <h1>Detector de Mastite</h1>
   <div class="status" id="status">Teste nao iniciado</div>
+
+  <div class="buttons">
+    <button id="btnLeitura" onclick="lerSensores()">Ler Sensores</button>
+  </div>
+  <div id="leituraPanel">
+    <span id="fecharLeitura" onclick="fecharLeitura()">&times;</span>
+    Temperatura atual: <span id="tempAtual">--</span> C | Condutividade atual: <span id="condAtual">--</span>
+  </div>
 
   <div class="buttons">
     <button id="btnIniciar" onclick="iniciar()">Iniciar Teste</button>
@@ -84,7 +100,6 @@ const char PAGE_HTML[] PROGMEM = R"rawliteral(
 <script>
 function atualizarTela(data) {
   document.getElementById('status').innerText = data.statusMsg;
-
   for (let i = 1; i <= 4; i++) {
     let statusEl = document.getElementById('s' + i);
     if (data.captured[i-1]) {
@@ -109,7 +124,6 @@ function atualizarTela(data) {
       statusEl.className = "aguardando";
     }
   }
-
   let warningDiv = document.getElementById('warning');
   if (data.resultadosCalculados && data.temMastite) {
     warningDiv.style.display = "block";
@@ -126,6 +140,21 @@ function chamar(rota) {
     .catch(err => alert("Erro de comunicacao com a placa"));
 }
 
+function lerSensores() {
+  fetch('/read')
+    .then(res => res.json())
+    .then(data => {
+      document.getElementById('tempAtual').innerText = data.temp.toFixed(1);
+      document.getElementById('condAtual').innerText = data.cond;
+      document.getElementById('leituraPanel').style.display = "block";
+    })
+    .catch(err => alert("Erro de comunicacao com a placa"));
+}
+
+function fecharLeitura() {
+  document.getElementById('leituraPanel').style.display = "none";
+}
+
 function iniciar() { chamar('/start'); }
 function capturar() { chamar('/capture'); }
 function parar() { chamar('/stop'); }
@@ -137,7 +166,6 @@ window.onload = function() { chamar('/status'); };
 </html>
 )rawliteral";
 
-// ---------- Funcoes auxiliares ----------
 float medianaOutros(float arr[4], int idx) {
   float outros[3];
   int k = 0;
@@ -160,19 +188,14 @@ void calcularResultados() {
   for (int i = 0; i < 4; i++) {
     float medTempOutros = medianaOutros(temps, i);
     float medCondOutros = medianaOutros(conds, i);
-
     float diffTemp = temps[i] - medTempOutros;
     float diffCond = conds[i] - medCondOutros;
-
     float relTemp = (medTempOutros != 0) ? diffTemp / medTempOutros : 0;
     float relCond = (medCondOutros != 0) ? diffCond / medCondOutros : 0;
-
     bool tempFlag = (diffTemp > MIN_ABS_DIFF_TEMP) && (relTemp > REL_THRESHOLD);
     bool condFlag = (diffCond > MIN_ABS_DIFF_COND) && (relCond > REL_THRESHOLD);
-
     bool relFlag = tempFlag || condFlag;
     bool absFlag = (temps[i] > TEMP_REF * MARGIN) || (conds[i] > COND_REF * MARGIN);
-
     mastiteDetectado[i] = relFlag || absFlag;
   }
   resultadosCalculados = true;
@@ -189,7 +212,6 @@ String buildStatusJson() {
   } else {
     statusMsg = "Teste parado";
   }
-
   bool temMastite = false;
   String tetosAfetados = "";
   for (int i = 0; i < 4; i++) {
@@ -199,26 +221,21 @@ String buildStatusJson() {
       tetosAfetados += String(i + 1);
     }
   }
-
   String json = "{";
   json += "\"statusMsg\":\"" + statusMsg + "\",";
   json += "\"testRunning\":" + String(testRunning ? "true" : "false") + ",";
   json += "\"currentTeat\":" + String(currentTeat) + ",";
   json += "\"resultadosCalculados\":" + String(resultadosCalculados ? "true" : "false") + ",";
   json += "\"temMastite\":" + String(temMastite ? "true" : "false") + ",";
-
   json += "\"temps\":[" + String(temps[0],1) + "," + String(temps[1],1) + "," + String(temps[2],1) + "," + String(temps[3],1) + "],";
   json += "\"conds\":[" + String(conds[0],0) + "," + String(conds[1],0) + "," + String(conds[2],0) + "," + String(conds[3],0) + "],";
-
   json += "\"captured\":[" + String(captured[0]?"true":"false") + "," + String(captured[1]?"true":"false") + "," + String(captured[2]?"true":"false") + "," + String(captured[3]?"true":"false") + "],";
   json += "\"mastite\":[" + String(mastiteDetectado[0]?"true":"false") + "," + String(mastiteDetectado[1]?"true":"false") + "," + String(mastiteDetectado[2]?"true":"false") + "," + String(mastiteDetectado[3]?"true":"false") + "],";
-
   json += "\"tetosAfetados\":[" + tetosAfetados + "]";
   json += "}";
   return json;
 }
 
-// ---------- Handlers HTTP ----------
 void handleRoot() {
   server.send_P(200, "text/html", PAGE_HTML);
 }
@@ -228,10 +245,7 @@ void handleStart() {
   currentTeat = 1;
   resultadosCalculados = false;
   for (int i = 0; i < 4; i++) {
-    temps[i] = 0;
-    conds[i] = 0;
-    captured[i] = false;
-    mastiteDetectado[i] = false;
+    temps[i] = 0; conds[i] = 0; captured[i] = false; mastiteDetectado[i] = false;
   }
   server.send(200, "application/json", buildStatusJson());
 }
@@ -241,20 +255,14 @@ void handleCapture() {
     server.send(200, "application/json", buildStatusJson());
     return;
   }
-
   sensors.requestTemperatures();
   float temperatura = sensors.getTempCByIndex(0);
   int condutividade = analogRead(EC_PIN);
-
-  if (temperatura == DEVICE_DISCONNECTED_C) {
-    temperatura = 0;
-  }
-
+  if (temperatura == DEVICE_DISCONNECTED_C) temperatura = 0;
   int idx = currentTeat - 1;
   temps[idx] = temperatura;
   conds[idx] = condutividade;
   captured[idx] = true;
-
   if (currentTeat == 4) {
     calcularResultados();
     testRunning = false;
@@ -262,7 +270,6 @@ void handleCapture() {
   } else {
     currentTeat++;
   }
-
   server.send(200, "application/json", buildStatusJson());
 }
 
@@ -276,10 +283,7 @@ void handleReset() {
   currentTeat = 0;
   resultadosCalculados = false;
   for (int i = 0; i < 4; i++) {
-    temps[i] = 0;
-    conds[i] = 0;
-    captured[i] = false;
-    mastiteDetectado[i] = false;
+    temps[i] = 0; conds[i] = 0; captured[i] = false; mastiteDetectado[i] = false;
   }
   server.send(200, "application/json", buildStatusJson());
 }
@@ -288,20 +292,53 @@ void handleStatus() {
   server.send(200, "application/json", buildStatusJson());
 }
 
-// ---------- Setup / Loop ----------
+void handleRead() {
+  sensors.requestTemperatures();
+  float temperatura = sensors.getTempCByIndex(0);
+  int condutividade = analogRead(EC_PIN);
+  if (temperatura == DEVICE_DISCONNECTED_C) temperatura = 0;
+
+  String json = "{";
+  json += "\"temp\":" + String(temperatura, 1) + ",";
+  json += "\"cond\":" + String(condutividade);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
 void setup() {
   Serial.begin(115200);
   sensors.begin();
 
+  WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
   Serial.print("Conectando ao WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
+
+  unsigned long inicio = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - inicio < WIFI_TIMEOUT_MS) {
     delay(500);
     Serial.print(".");
   }
   Serial.println();
-  Serial.print("Conectado! IP: ");
-  Serial.println(WiFi.localIP());
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("Conectado ao WiFi! IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("Falha ao conectar. Iniciando modo AP...");
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID, AP_PASSWORD);
+    Serial.print("Rede AP criada: ");
+    Serial.println(AP_SSID);
+    Serial.print("IP do AP: ");
+    Serial.println(WiFi.softAPIP());
+  }
+
+  if (MDNS.begin("quickmast")) {
+    Serial.println("mDNS iniciado: http://quickmast.local");
+    MDNS.addService("http", "tcp", 80);
+  } else {
+    Serial.println("Erro ao iniciar mDNS");
+  }
 
   server.on("/", handleRoot);
   server.on("/start", handleStart);
@@ -309,11 +346,13 @@ void setup() {
   server.on("/stop", handleStop);
   server.on("/reset", handleReset);
   server.on("/status", handleStatus);
+  server.on("/read", handleRead);
 
   server.begin();
   Serial.println("Servidor web iniciado");
 }
 
 void loop() {
+  MDNS.update();
   server.handleClient();
 }
